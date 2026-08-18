@@ -1,0 +1,15 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  call-secure-release:
+    uses: ./.github/workflows/release.yml
+    with:
+      image_name: ${{ github.repository }}
+      dockerfile_path: 'Dockerfile'
+    secrets:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
