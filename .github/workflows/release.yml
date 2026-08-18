@@ -1,0 +1,148 @@
+name: Secure Reusable Release Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: 'Name of the Docker image (e.g., my-org/my-app)'
+        required: true
+        type: string
+      dockerfile_path:
+        description: 'Path to the Dockerfile'
+        required: false
+        type: string
+        default: 'Dockerfile'
+      context_path:
+        description: 'Docker build context path'
+        required: false
+        type: string
+        default: '.'
+      node_version:
+        description: 'Node.js version for semantic-release'
+        required: false
+        type: string
+        default: '20'
+    secrets:
+      SLACK_WEBHOOK_URL:
+        description: 'Slack webhook URL for notifications'
+        required: false
+
+jobs:
+  release:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # To push changelog/tags
+      issues: write   # To comment on issues
+      pull-requests: write # To comment on PRs
+    outputs:
+      new_release_published: ${{ steps.semantic.outputs.new_release_published }}
+      new_release_version: ${{ steps.semantic.outputs.new_release_version }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Required for semantic-release to read commit history
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Run Semantic Release
+        id: semantic
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm install -g semantic-release @semantic-release/git @semantic-release/changelog @semantic-release/github
+          npx semantic-release
+
+  build-sign-attest:
+    name: Build, Sign and Attest
+    needs: release
+    if: needs.release.outputs.new_release_published == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write       # To push to GHCR
+      id-token: write       # Required for Cosign keyless signing & Provenance
+      attestations: write   # Required for SLSA provenance
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.3'
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ inputs.image_name }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.release.outputs.new_release_version }}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.context_path }}
+          file: ${{ inputs.dockerfile_path }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Sign the published Docker image
+        env:
+          DIGEST: ${{ steps.build-and-push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          images=""
+          for tag in ${TAGS}; do
+            images+="${tag}@${DIGEST} "
+          done
+          cosign sign --yes ${images}
+
+      - name: Generate and attest SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ghcr.io/${{ inputs.image_name }}@${{ steps.build-and-push.outputs.digest }}
+          format: 'spdx-json'
+          output-file: 'sbom.spdx.json'
+      
+      - name: Attest Build Provenance (SLSA L3)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ghcr.io/${{ inputs.image_name }}
+          subject-digest: ${{ steps.build-and-push.outputs.digest }}
+          push-to-registry: true
+
+  notify:
+    name: Notify Status
+    needs: [release, build-sign-attest]
+    if: always() && needs.release.outputs.new_release_published == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Slack Notification
+        if: ${{ env.SLACK_WEBHOOK_URL != '' }}
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action,eventName,ref,workflow
+          text: "Deployed v${{ needs.release.outputs.new_release_version }} of ${{ inputs.image_name }}"
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
