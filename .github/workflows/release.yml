@@ -51,18 +51,16 @@ jobs:
         with:
           fetch-depth: 0 # Required for semantic-release to read commit history
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ inputs.node_version }}
-
       - name: Run Semantic Release
         id: semantic
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          extra_plugins: |
+            @semantic-release/git
+            @semantic-release/changelog
+            @semantic-release/github
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          npm install -g semantic-release @semantic-release/git @semantic-release/changelog @semantic-release/github
-          npx semantic-release
 
   build-sign-attest:
     name: Build, Sign and Attest
